@@ -1,0 +1,8 @@
+IPHONE'A CIKIS (her yeni surumde)
+=================================
+1. Unity: File > Build Profiles > iOS > Build. Klasor: C:\nene-ios (sorarsa Replace).
+2. Bu klasordeki her seyi (.github, .gitattributes, hazirla.bat, hazirla.ps1, gonder.bat, nene-ikon-1024.png)
+   C:\nene-ios icine kopyala.
+3. C:\nene-ios icinde once hazirla.bat, sonra gonder.bat calistir.
+4. GitHub > Actions: en son is yesil olunca 10-30 dk sonra TestFlight'ta gorunur.
+   Onceki isler iptal (gri) ya da kirmizi olabilir, onemli degil.

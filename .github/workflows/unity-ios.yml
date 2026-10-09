@@ -1,0 +1,171 @@
+name: Unity iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nene-ios
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: Build signed Nene IPA (Unity)
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reassemble split files and fix permissions
+        run: |
+          set -euo pipefail
+          find . -name "*.part000" | while read -r p; do base="${p%.part000}"; cat "$base".part* > "$base"; rm "$base".part*; echo "birlestirildi: $base"; done
+          find . -type f -name "*.sh" -exec sed -i '' $'s/\r$//' {} + || true
+          find . -type f \( -name "*.sh" -o -name "usymtool" -o -name "il2cpp" -o -name "UnityLinker" -o -name "bee_backend" \) -exec chmod +x {} + || true
+          chmod -R +x Il2CppOutputProject/IL2CPP/build 2>/dev/null || true
+          test -d Unity-iPhone.xcodeproj || { echo 'Unity-iPhone.xcodeproj yok: Unity iOS build klasorunun ICINDEN push edilmeli' >&2; exit 1; }
+          xcodebuild -version
+
+      - name: Add 1024 App Store icon
+        run: |
+          set -euo pipefail
+          SET=Unity-iPhone/Images.xcassets/AppIcon.appiconset
+          test -f nene-ikon-1024.png || { echo 'nene-ikon-1024.png yok' >&2; exit 1; }
+          cp nene-ikon-1024.png "$SET/Icon-Store-1024.png"
+          python3 - "$SET/Contents.json" <<'PY'
+          import json, sys
+          p = sys.argv[1]; d = json.load(open(p))
+          imgs = d.get("images", [])
+          if any(i.get("idiom") == "ios-marketing" and i.get("filename") for i in imgs): print("Unity 1024 ikonu zaten koymus"); sys.exit(0)
+          imgs = [i for i in imgs if i.get("idiom") != "ios-marketing"]
+          imgs.append({"filename": "Icon-Store-1024.png", "idiom": "ios-marketing", "scale": "1x", "size": "1024x1024"})
+          d["images"] = imgs; json.dump(d, open(p, "w"), indent=2); print("1024 ikon eklendi")
+          PY
+
+      - name: Install Apple signing material
+        env:
+          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          IOS_PROFILE_BASE64: ${{ secrets.IOS_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$IOS_P12_BASE64" ] || [ -z "$IOS_P12_PASSWORD" ] || [ -z "$IOS_PROFILE_BASE64" ]; then
+            echo 'Missing one of IOS_P12_BASE64, IOS_P12_PASSWORD, IOS_PROFILE_BASE64' >&2; exit 1
+          fi
+          P12_PATH="$RUNNER_TEMP/distribution.p12"; PROFILE_PATH="$RUNNER_TEMP/nene.mobileprovision"; PROFILE_PLIST="$RUNNER_TEMP/nene-profile.plist"
+          KEYCHAIN_PATH="$RUNNER_TEMP/nene-signing.keychain-db"; KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          printf '%s' "$IOS_P12_BASE64" | base64 -D > "$P12_PATH"
+          printf '%s' "$IOS_PROFILE_BASE64" | base64 -D > "$PROFILE_PATH"
+          security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
+          TEAM_ID="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PROFILE_PLIST")"
+          PROFILE_UUID="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PROFILE_PLIST")"
+          PROFILE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PROFILE_PLIST")"
+          APP_IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST")"
+          BUNDLE_ID="${APP_IDENTIFIER#*.}"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security import "$P12_PATH" -k "$KEYCHAIN_PATH" -P "$IOS_P12_PASSWORD" -A -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          { echo "IOS_TEAM_ID=$TEAM_ID"; echo "IOS_PROFILE_UUID=$PROFILE_UUID"; echo "IOS_PROFILE_NAME=$PROFILE_NAME"; echo "IOS_BUNDLE_ID=$BUNDLE_ID"; } >> "$GITHUB_ENV"
+
+      - name: Configure signing (app target only) and version
+        run: |
+          set -euo pipefail
+          gem install xcodeproj --user-install --no-document
+          ruby <<'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open('Unity-iPhone.xcodeproj')
+          project.targets.each do |target|
+            target.build_configurations.each do |c|
+              c.build_settings['DEVELOPMENT_TEAM'] = ENV.fetch('IOS_TEAM_ID')
+              c.build_settings['CODE_SIGN_STYLE'] = 'Manual'
+              if target.name == 'Unity-iPhone'
+                c.build_settings['CODE_SIGN_IDENTITY'] = 'Apple Distribution'
+                c.build_settings['CODE_SIGN_IDENTITY[sdk=iphoneos*]'] = 'Apple Distribution'
+                c.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = ENV.fetch('IOS_PROFILE_NAME')
+                c.build_settings['PRODUCT_BUNDLE_IDENTIFIER'] = ENV.fetch('IOS_BUNDLE_ID')
+              else
+                c.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = ''
+                c.build_settings['PROVISIONING_PROFILE'] = ''
+              end
+            end
+          end
+          project.save
+          puts 'Signing configured.'
+          RUBY
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER}" Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.10.0" Info.plist
+          /usr/libexec/PlistBuddy -c "Add :CADisableMinimumFrameDurationOnPhone bool true" Info.plist 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :CADisableMinimumFrameDurationOnPhone true" Info.plist
+          /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" Info.plist 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :ITSAppUsesNonExemptEncryption false" Info.plist
+
+      - name: Create signed Xcode archive
+        run: |
+          set -euo pipefail
+          xcodebuild archive -project Unity-iPhone.xcodeproj -scheme Unity-iPhone -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Nene.xcarchive"
+
+      - name: Export signed App Store IPA
+        run: |
+          set -euo pipefail
+          EXPORT_OPTIONS="$RUNNER_TEMP/NeneExportOptions.plist"
+          cat > "$EXPORT_OPTIONS" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>teamID</key><string>$IOS_TEAM_ID</string>
+            <key>provisioningProfiles</key>
+            <dict><key>$IOS_BUNDLE_ID</key><string>$IOS_PROFILE_UUID</string></dict>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$EXPORT_OPTIONS"
+          mkdir -p build/ipa
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Nene.xcarchive" -exportOptionsPlist "$EXPORT_OPTIONS" -exportPath build/ipa
+          test -n "$(find build/ipa -maxdepth 1 -name '*.ipa' -print -quit)"
+
+      - name: Make IPA available for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: nene-unity-signed-ipa
+          path: build/ipa/*.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload to TestFlight
+        if: env.ASC_KEY_ID != '' && env.ASC_ISSUER_ID != ''
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          printf '%s' "$ASC_KEY_P8" > "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          IPA="$(find build/ipa -maxdepth 1 -name '*.ipa' -print -quit)"
+          xcrun altool --upload-app -f "$IPA" -t ios --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+      - name: Remove temporary Apple signing material
+        if: always()
+        run: |
+          if [ -n "${IOS_PROFILE_UUID:-}" ]; then rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$IOS_PROFILE_UUID.mobileprovision"; fi
+          security delete-keychain "$RUNNER_TEMP/nene-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/distribution.p12" "$RUNNER_TEMP/nene.mobileprovision" "$RUNNER_TEMP/nene-profile.plist" "$RUNNER_TEMP/NeneExportOptions.plist"
